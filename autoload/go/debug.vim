@@ -11,6 +11,7 @@ if !exists('s:state')
         \ 'currentThread': {},
         \ 'localVars': {},
         \ 'functionArgs': {},
+        \ 'registers': {},
         \ 'message': [],
         \ 'resultHandlers': {},
         \ 'kill_on_detach': v:true,
@@ -218,7 +219,6 @@ function! s:show_variables() abort
 
   let l:cur_win = bufwinnr('')
   exe l:var_win 'wincmd w'
-
   try
     setlocal modifiable
     silent %delete _
@@ -239,6 +239,14 @@ function! s:show_variables() abort
       endfor
     endif
 
+    let v += ['']
+    let v += ['# Registers']
+    if type(get(s:state, 'registers', [])) is type([])
+      for c in s:state['registers']
+        let v += [printf("%s = %s", c.Name, c.Value)]
+      endfor
+    endif
+
     call setline(1, v)
   finally
     setlocal nomodifiable
@@ -251,6 +259,7 @@ function! s:clearState() abort
   let s:state['currentThread'] = {}
   let s:state['localVars'] = {}
   let s:state['functionArgs'] = {}
+  let s:state['registers'] = {}
   let s:state['message'] = []
 
   silent! sign unplace 9999
@@ -474,7 +483,7 @@ function! s:start_cb() abort
     silent file `='__GODEBUG_VARIABLES__'`
     setlocal buftype=nofile bufhidden=wipe nomodified nobuflisted noswapfile nowrap nonumber nocursorline
     setlocal filetype=godebugvariables
-    call append(0, ["# Local Variables", "", "# Function Arguments"])
+    call append(0, ["# Local Variables", "", "# Function Arguments", "", "# Registers"])
     nmap <buffer> <silent> <cr> :<c-u>call <SID>expand_var()<cr>
     nmap <buffer> q <Plug>(go-debug-stop)
   endif
@@ -966,21 +975,65 @@ function! s:eval(arg) abort
     let l:promise = go#promise#New(function('s:rpc_response'), 20000, {})
     call s:call_jsonrpc(l:promise.wrapper, 'RPCServer.State')
     let l:res = l:promise.await()
-    let l:promise = go#promise#New(function('s:rpc_response'), 20000, {})
-    call s:call_jsonrpc(l:promise.wrapper, 'RPCServer.Eval', {
+
+    let l:cmd = 'RPCServer.Eval'
+    let l:args = {
           \ 'expr':  a:arg,
           \ 'scope': {'GoroutineID': l:res.result.State.currentThread.goroutineID}
-      \ })
+      \ }
+
+    let l:ResultFn = funcref('s:evalResult', [])
+    if a:arg =~ '^call '
+      let l:cmd = 'RPCServer.Command'
+      let l:args = {
+            \ 'name': 'call',
+            \ 'Expr': a:arg[5:],
+            \ 'ReturnInfoLoadConfig': {
+              \ 'FollowPointers': v:false,
+              \ 'MaxVariableRecurse': 10,
+              \ 'MaxStringLen': 80,
+              \ 'MaxArrayValues': 10,
+              \ 'MaxStructFields': 10,
+            \ },
+          \ }
+
+      let l:ResultFn = funcref('s:callResult', [])
+    endif
+
+    let l:promise = go#promise#New(function('s:rpc_response'), 20000, {})
+    call s:call_jsonrpc(l:promise.wrapper, l:cmd, l:args)
 
     let l:res = l:promise.await()
 
-    return s:eval_tree(l:res.result.Variable, 0, 0)
+    let l:result = call(l:ResultFn, [l:res.result])
+
+    " l:result will be a list when evaluating a call expression.
+    if type(l:result) is type([])
+      let l:result = map(l:result, funcref('s:renameEvalReturnValue'))
+      if len(l:result) isnot 1
+        return map(l:result, 's:eval_tree(v:val, 0, 0)')
+      endif
+      let l:result = l:result[0]
+    endif
+    return s:eval_tree(l:result, 0, 0)
   catch
     call go#util#EchoError(printf('evaluation failed: %s', v:exception))
     return ''
   endtry
 endfunction
 
+function! s:callResult(res) abort
+  return a:res.State.currentThread.ReturnValues
+endfunction
+
+function! s:evalResult(res) abort
+  return a:res.Variable
+endfunction
+
+function! s:renameEvalReturnValue(key, val) abort
+  let a:val.name = printf('[%s]', string(a:key))
+  return a:val
+endfunction
 
 function! go#debug#BalloonExpr() abort
   silent! let l:v = s:eval(v:beval_text)
@@ -989,7 +1042,14 @@ endfunction
 
 function! go#debug#Print(arg) abort
   try
-    echo substitute(s:eval(a:arg), "\n$", "", 0)
+    let l:result = s:eval(a:arg)
+    if type(l:result) is type([])
+      echo join(map(l:result, 'substitute(v:val, "\n$", "", '''')'), "\n")
+      return
+    elseif type(l:result) isnot type('')
+      throw 'unexpected result'
+    endif
+    echo substitute(l:result, "\n$", "", '')
   catch
     call go#util#EchoError(printf('could not print: %s', v:exception))
   endtry
@@ -1117,6 +1177,12 @@ function! s:update_variables() abort
     call go#util#EchoError(printf('could not list function arguments: %s', v:exception))
   endtry
 
+  try
+    call s:call_jsonrpc(function('s:handle_list_registers'), 'RPCServer.ListRegisters', l:cfg)
+  catch
+    call go#util#EchoError(printf('could not list registers: %s', v:exception))
+  endtry
+
 endfunction
 
 function! s:handle_list_local_vars(check_errors, res) abort
@@ -1142,6 +1208,20 @@ function! s:handle_list_function_args(check_errors, res) abort
     endif
   catch
     call go#util#EchoWarning(printf('could not list function arguments: %s', v:exception))
+  endtry
+
+  call s:show_variables()
+endfunction
+
+function! s:handle_list_registers(check_errors, res) abort
+  let s:state['registers'] = {}
+  try
+    call a:check_errors()
+    if type(a:res) is type({}) && has_key(a:res, 'result') && !empty(a:res.result)
+      let s:state['registers'] = a:res.result['Regs']
+    endif
+  catch
+    call go#util#EchoWarning(printf('could not list registers: %s', v:exception))
   endtry
 
   call s:show_variables()
@@ -1300,6 +1380,7 @@ function! go#debug#Restart() abort
           \ 'currentThread': {},
           \ 'localVars': {},
           \ 'functionArgs': {},
+          \ 'registers': {},
           \ 'message': [],
           \ 'resultHandlers': {},
           \ 'kill_on_detach': s:state['kill_on_detach'],
