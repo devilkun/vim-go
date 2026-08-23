@@ -137,32 +137,6 @@ function! go#config#ListAutoclose() abort
   return get(g:, 'go_list_autoclose', 1)
 endfunction
 
-function! go#config#InfoMode() abort
-  return get(g:, 'go_info_mode', 'gopls')
-endfunction
-
-function! go#config#GuruScope() abort
-  let scope = get(g:, 'go_guru_scope', [])
-
-  if !empty(scope)
-    " strip trailing slashes for each path in scope. bug:
-    " https://github.com/golang/go/issues/14584
-    let scopes = go#util#StripTrailingSlash(scope)
-  endif
-
-  return scope
-endfunction
-
-function! go#config#SetGuruScope(scope) abort
-  if empty(a:scope)
-    if exists('g:go_guru_scope')
-      unlet g:go_guru_scope
-    endif
-  else
-    let g:go_guru_scope = a:scope
-  endif
-endfunction
-
 function! go#config#EchoCommandInfo() abort
   return get(g:, 'go_echo_command_info', 1)
 endfunction
@@ -200,6 +174,10 @@ function! go#config#Debug() abort
   return get(g:, 'go_debug', [])
 endfunction
 
+function! go#config#DebugLogDelay() abort
+  return get(g:, 'go_debug_log_delay', 10)
+endfunction
+
 function! go#config#DebugWindows() abort
   return get(g:, 'go_debug_windows', {
             \ 'vars':  'leftabove 30vnew',
@@ -209,6 +187,10 @@ function! go#config#DebugWindows() abort
             \ }
          \ )
 
+endfunction
+
+function! go#config#DebugSubstitutePaths() abort
+  return get(g:, 'go_debug_substitute_paths', [])
 endfunction
 
 function! go#config#DebugPreserveLayout() abort
@@ -280,7 +262,7 @@ endfunction
 function! go#config#MetalinterEnabled() abort
   let l:default = []
   if get(g:, 'go_metalinter_command', s:default_metalinter) == 'golangci-lint'
-    let l:default = ['vet', 'revive', 'errcheck']
+    let l:default = ['govet', 'revive', 'errcheck']
   endif
 
   return get(g:, 'go_metalinter_enabled', l:default)
